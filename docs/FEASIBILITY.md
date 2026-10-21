@@ -13,7 +13,7 @@
 
 **The headline claim is not achievable.** "Which processes did Vanguard read memory from" can't be observed by any supported means (details below). The README and spec now say so. Everything else the README asks is answerable, fully or mostly.
 
-**The minifilter (Phase 6) is worth less than the spec implies.** It sees file I/O only, can't see memory reads, and needs a production-signed build to observe anti-cheats, which refuse to run in test-signing mode. Defer it until ETW-only results show a gap worth a signed driver.
+**The minifilter (Phase 7) is worth less than the spec implies.** It sees file I/O only, can't see memory reads, and needs a production-signed build to observe anti-cheats, which refuse to run in test-signing mode. Defer it until ETW-only results show a gap worth a signed driver.
 
 ---
 
@@ -45,7 +45,7 @@ The honest product statement is the one the README now makes: Sentinel reports h
 **What it does best, from most to least solid:**
 
 1. **Lifecycle and persistence.** Which anti-cheat drivers are loaded, since when, and whether they stayed after the game exited or was uninstalled. This is fully observable and cheap, and it's the question players ask most.
-2. **Known-abused drivers.** Ransomware abused `mhyprot2.sys` (Genshin Impact) in 2022 to kill antivirus software, and the game didn't need to be installed (Trend Micro, Aug 2022). Flagging loaded or present drivers against the [LOLDrivers](https://www.loldrivers.io/) list is a concrete security win. **Not in the spec yet. Recommend adding it.**
+2. **Known-abused drivers.** Ransomware abused `mhyprot2.sys` (Genshin Impact) in 2022 to kill antivirus software, and the game didn't need to be installed (Trend Micro, Aug 2022). Flagging loaded or present drivers against the [LOLDrivers](https://www.loldrivers.io/) list is a concrete security win. Specified as Phase 5 of `SPEC.md`.
 3. **Network accounting** per anti-cheat product: destinations, timing, volume.
 4. **Handle-open auditing:** which of your processes the anti-cheat's service asks for memory-read access to.
 5. **File and registry attribution** via call stacks. Valuable but carries the most uncertainty; the Phase 2 spike below decides it.
@@ -68,7 +68,7 @@ Nothing found that turns this into an end-user audit trail. Sentinel's niche is 
 
 ## Recommended scope changes
 
-1. **Build ETW-only first (Phases 1–5).** Treat Phase 6 as conditional.
+1. **Build ETW-only first (Phases 1–6).** Treat Phase 7 as conditional.
 2. **Start Phase 2 with a spike on real hardware.** Session 4 should run on a Windows machine with Vanguard or EAC installed and answer:
    - Do stack-attributed file and registry events from the anti-cheat driver appear at all?
    - What are the event rate and CPU cost with stacks on? The target is under 2% CPU.
@@ -77,7 +77,7 @@ Nothing found that turns this into an end-user audit trail. Sentinel's niche is 
 
    Go/no-go on feature 5 above depends on the first two answers.
 3. **Attribute by product, not just by `.sys`.** Most observable anti-cheat activity comes from the user-mode service (`vgc.exe` for Vanguard), not the kernel driver. The profile already lists both. Reports and `--driver` filters should roll up by profile.
-4. **Add a known-vulnerable-driver check** (LOLDrivers, and Microsoft's vulnerable driver blocklist).
+4. **Add a known-vulnerable-driver check** (LOLDrivers, and Microsoft's vulnerable driver blocklist). Done: Phase 5 of `SPEC.md`.
 5. **Make coverage explicit in every report:** observed, not observed, and not observable.
 
 ---
@@ -89,7 +89,7 @@ Every item marked "verified" was reproduced against the code exactly as written 
 | # | Problem | How verified | Fix |
 |---|---|---|---|
 | 1 | FTS5 index desyncs on any `UPDATE` to `events` (no update trigger) | SQLite 3.45: `integrity-check` fails with "database disk image is malformed" | Added `events_fts_update` trigger. Integrity holds after update and delete. |
-| 2 | Profile TOML (Phase 7) doesn't load into `DriverProfile` (Phase 1): nested tables vs. flat struct; `"boot_start"` rejected by `LoadBehavior` | `toml` crate: "missing field `name`"; serde: "unknown variant `boot_start`" | Struct mirrors the TOML, with `snake_case` enum names. Gained `games.executables` (needed for the persistence alert) and `sources`. |
+| 2 | Profile TOML (Phase 8) doesn't load into `DriverProfile` (Phase 1): nested tables vs. flat struct; `"boot_start"` rejected by `LoadBehavior` | `toml` crate: "missing field `name`"; serde: "unknown variant `boot_start`" | Struct mirrors the TOML, with `snake_case` enum names. Gained `games.executables` (needed for the persistence alert) and `sources`. |
 | 3 | `ServiceConfig` doesn't compile: `EtwConfig` lacks `Debug`/`Serialize`/`Deserialize` | rustc: 5 errors | Added derives. |
 | 4 | Sample `config.toml` doesn't parse, and has `[service]`, `[pipeline]`, `[profiles]` sections the struct lacks | `toml` crate: "missing field `providers`" | Every config struct gets `#[serde(default)]` and a `Default`. Added the three missing sections. Sample and empty config both parse. |
 | 5 | Kernel-Audit-API-Calls declared but never enabled, so `ProcessAccess` had no source. Its comment claimed it logs `NtReadVirtualMemory`. | Event map from [API-To-ETW](https://github.com/jdu2600/API-To-ETW): IDs 1–8, no memory reads | Added to default providers; corrected the comment; noted why Threat-Intelligence is unusable. |
