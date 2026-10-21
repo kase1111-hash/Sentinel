@@ -143,7 +143,8 @@ sentinel/
 │   ├── METHODOLOGY.md
 │   ├── ANTI-CHEAT-MAP.md
 │   ├── LEGAL.md
-│   └── DRIVER-SIGNING.md
+│   ├── DRIVER-SIGNING.md
+│   └── FEASIBILITY.md              # Design review: what works, what can't be observed
 │
 └── scripts/
     ├── install-service.ps1
@@ -236,7 +237,8 @@ pub struct SentinelEvent {
 /// High-level event categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EventType {
-    ProcessAccess,       // Reading another process's memory or handle table
+    ProcessAccess,       // Handle opened to another process (with requested access rights).
+                         // Not memory reads: those are not observable (see Driver attribution).
     ProcessCreate,       // New process spawned
     ProcessTerminate,    // Process exited
     ImageLoad,           // DLL or driver loaded into a process/kernel
@@ -421,21 +423,61 @@ pub enum SortField {
     DriverName,
 }
 
-/// Anti-cheat driver profile loaded from TOML.
+/// Anti-cheat driver profile loaded from TOML (see Phase 7 for the file format).
+/// Mirrors the TOML layout so `toml::from_str::<DriverProfile>(..)` works directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriverProfile {
+    pub driver: ProfileDriver,
+    pub games: ProfileGames,
+    pub expected_behavior: ExpectedBehavior,
+    #[serde(default)]
+    pub known_activity: KnownActivity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileDriver {
     pub name: String,
     pub vendor: String,
-    pub driver_filenames: Vec<String>,
-    pub known_publishers: Vec<String>,
+    /// Kernel driver and user-mode component filenames (e.g., "vgk.sys", "vgc.exe").
+    pub filenames: Vec<String>,
+    pub publishers: Vec<String>,
     pub load_behavior: LoadBehavior,
-    pub associated_games: Vec<String>,
-    pub expected_directories: Vec<String>,
-    pub known_network_destinations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileGames {
+    pub titles: Vec<String>,
+    /// Game executables. Needed to detect "game exited" for PersistenceAfterExit.
+    pub executables: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectedBehavior {
+    pub install_directories: Vec<String>,
+    /// Hostname globs. Network events carry IPs, so matching requires correlating
+    /// with DNS-Client events from the same process.
+    pub network_destinations: Vec<String>,
+}
+
+/// Community-reported behavior. Sentinel does not verify these claims — several
+/// (e.g., memory reads) are outside what it can observe. Each claim needs a source.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KnownActivity {
+    pub scans_all_processes: Option<bool>,
+    pub scans_at_boot: Option<bool>,
+    pub persists_after_game_exit: Option<bool>,
+    pub reads_browser_memory: Option<bool>,
+    pub enumerates_installed_software: Option<bool>,
+    pub checks_hypervisor_presence: Option<bool>,
+    #[serde(default)]
     pub notes: String,
+    /// URLs or citations backing the claims above.
+    #[serde(default)]
+    pub sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LoadBehavior {
     /// Loads at boot, persists regardless of game state.
     BootStart,
@@ -615,6 +657,15 @@ CREATE TRIGGER events_fts_delete AFTER DELETE ON events BEGIN
     VALUES ('delete', old.id, old.target, old.source_name, old.driver_name);
 END;
 
+-- Without this, any UPDATE (e.g., backfilling driver attribution) desyncs the
+-- external-content FTS index and its integrity-check reports corruption.
+CREATE TRIGGER events_fts_update AFTER UPDATE ON events BEGIN
+    INSERT INTO events_fts(events_fts, rowid, target, source_name, driver_name)
+    VALUES ('delete', old.id, old.target, old.source_name, old.driver_name);
+    INSERT INTO events_fts(rowid, target, source_name, driver_name)
+    VALUES (new.id, new.target, new.source_name, new.driver_name);
+END;
+
 -- Driver sessions table — aggregated view of driver activity periods
 CREATE TABLE driver_sessions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -678,7 +729,7 @@ impl Store {
     /// Open or create the database at the given path.
     pub fn open(path: &Path) -> Result<Self>;
 
-    /// Open at the default location: %APPDATA%\Sentinel\data\sentinel.db
+    /// Open at the default location: %ProgramData%\Sentinel\data\sentinel.db
     pub fn open_default() -> Result<Self>;
 
     // ── Writing ──
@@ -866,8 +917,16 @@ pub const KERNEL_REGISTRY_GUID: &str = "70EB4F03-C1DE-4F73-A051-33D13D5413BD";
 pub const KERNEL_NETWORK_GUID: &str = "7DD42A49-5329-4832-8DFD-43D979153A88";
 
 /// Microsoft-Windows-Kernel-Audit-API-Calls
-/// Events: NtOpenProcess, NtReadVirtualMemory, etc.
+/// Events: OpenProcess (ID 5: TargetProcessId, DesiredAccess, ReturnCode),
+/// OpenThread (ID 6), TerminateProcess (ID 2), PsSetLoadImageNotifyRoutine (ID 1).
+/// Does NOT log memory reads (NtReadVirtualMemory / MmCopyVirtualMemory). Do not
+/// assume kernel-mode handle opens appear here; treat it as user-mode coverage.
+/// Source of every EventType::ProcessAccess event in ETW-only mode.
 pub const KERNEL_AUDIT_GUID: &str = "E02A841C-75A3-4FA7-AFC8-AE09CF9B7F23";
+
+// Not usable: Microsoft-Windows-Threat-Intelligence (logs READVM/WRITEVM) only
+// delivers events to Antimalware-PPL consumers, which requires an ELAM driver
+// signed through Microsoft's antimalware program.
 
 /// Microsoft-Windows-DNS-Client
 /// Events: DNS resolution
@@ -915,6 +974,9 @@ pub const DNS_CLIENT_GUID: &str = "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D";
 
 ```rust
 /// Configuration for the ETW session.
+/// `#[serde(default)]` lets config.toml set only the fields it cares about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EtwConfig {
     /// Session name (must be unique on the system).
     pub session_name: String,
@@ -930,12 +992,18 @@ pub struct EtwConfig {
     pub flush_timer_seconds: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub guid: String,
     pub level: TraceLevel,
     pub keywords: u64,      // Bitmask to select specific event categories
+    /// Request kernel+user call stacks with each event (EVENT_ENABLE_PROPERTY_STACK_TRACE).
+    /// This is how ETW-only mode attributes file/registry events to a driver.
+    #[serde(default)]
+    pub stack_trace: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum TraceLevel {
     Critical = 1,
     Error = 2,
@@ -953,26 +1021,37 @@ impl Default for EtwConfig {
                     guid: KERNEL_PROCESS_GUID.to_string(),
                     level: TraceLevel::Info,
                     keywords: 0x10 | 0x20 | 0x40,  // Process, Thread, Image
+                    stack_trace: false,
                 },
                 ProviderConfig {
                     guid: KERNEL_FILE_GUID.to_string(),
                     level: TraceLevel::Info,
                     keywords: 0xFFFF,  // All file operations
+                    stack_trace: true,
                 },
                 ProviderConfig {
                     guid: KERNEL_REGISTRY_GUID.to_string(),
                     level: TraceLevel::Info,
                     keywords: 0xFFFF,
+                    stack_trace: true,
                 },
                 ProviderConfig {
                     guid: KERNEL_NETWORK_GUID.to_string(),
                     level: TraceLevel::Info,
                     keywords: 0xFFFF,
+                    stack_trace: false,
+                },
+                ProviderConfig {
+                    guid: KERNEL_AUDIT_GUID.to_string(),
+                    level: TraceLevel::Info,
+                    keywords: 0xFFFF,
+                    stack_trace: false,
                 },
                 ProviderConfig {
                     guid: DNS_CLIENT_GUID.to_string(),
                     level: TraceLevel::Info,
                     keywords: 0xFFFF,
+                    stack_trace: false,
                 },
             ],
             buffer_size_kb: 256,
@@ -1018,45 +1097,71 @@ Use `StartTrace`, `EnableTraceEx2`, `OpenTrace`, `ProcessTrace`, `StopTrace` fro
 The `ferrisetw` crate provides a safe Rust wrapper around ETW. Significantly less boilerplate. Recommended for initial implementation. Switch to raw API only if ferrisetw proves limiting.
 
 ```rust
-// Example using ferrisetw (preferred approach)
-use ferrisetw::provider::Provider;
-use ferrisetw::trace::UserTrace;
-use ferrisetw::native::etw_types::EventRecord;
+// Example using ferrisetw 1.2 (preferred approach). Type-checked against
+// ferrisetw 1.2.0 for x86_64-pc-windows-msvc.
+use ferrisetw::native::ExtendedDataItem;
+use ferrisetw::parser::Parser;
+use ferrisetw::provider::{Provider, TraceFlags};
+use ferrisetw::trace::{TraceError, TraceTrait, UserTrace};
+use ferrisetw::{EventRecord, SchemaLocator};
 
-let process_provider = Provider::by_guid(KERNEL_PROCESS_GUID)
-    .add_callback(|record: &EventRecord, schema| {
-        // Parse event fields from schema
-        // Construct SentinelEvent
-        // Send to channel
-    })
-    .build()?;
+// ferrisetw's TraceError does not implement std::error::Error, so wrap it in the
+// crate's own error type (or return it directly) rather than Box<dyn Error>.
+fn start() -> Result<(), TraceError> {
+    let file_provider = Provider::by_guid(KERNEL_FILE_GUID)
+        .any(0xFFFF) // keyword mask: see `logman query providers Microsoft-Windows-Kernel-File`
+        .trace_flags(TraceFlags::EVENT_ENABLE_PROPERTY_STACK_TRACE) // per-event call stack
+        .add_callback(|record: &EventRecord, locator: &SchemaLocator| {
+            let Ok(schema) = locator.event_schema(record) else { return };
+            let parser = Parser::create(record, &schema);
+            let _file_object: Option<u64> = parser.try_parse("FileObject").ok();
+            let _pid = record.process_id();
+            for item in record.extended_data() {
+                if let ExtendedDataItem::StackTrace64(stack) = item.to_extended_data_item() {
+                    // Resolve each return address against the kernel module table
+                    // (see Driver attribution below).
+                    let _frames: &[u64] = stack.addresses();
+                }
+            }
+            // Construct SentinelEvent, send to channel
+        })
+        .build(); // returns Provider, not Result
 
-let mut trace = UserTrace::new()
-    .named("SentinelTrace".to_string())
-    .enable(process_provider)
-    .enable(file_provider)
-    .enable(registry_provider)
-    .enable(network_provider)
-    .start()?;
+    let (trace, handle) = UserTrace::new()
+        .named("SentinelTrace".to_string())
+        .enable(file_provider)
+        // .enable(process_provider).enable(registry_provider) ...
+        .start()?;
+    // ProcessTrace blocks: run it on a dedicated thread; call trace.stop() on shutdown.
+    std::thread::spawn(move || UserTrace::process_from_handle(handle));
+    // ...
+    trace.stop()
+}
 ```
 
-**Critical: Kernel vs. User Trace Sessions**
+**Kernel vs. User Trace Sessions**
 
-Some kernel providers require a kernel trace session (`EVENT_TRACE_FLAG_*` flags on the system trace session) rather than a user-mode trace session. The Kernel-Process, Kernel-File, Kernel-Registry, and Kernel-Network providers work with `NT Kernel Logger` or with newer system-wide sessions. Requires administrator privileges.
+The manifest-based Kernel-Process, Kernel-File, Kernel-Registry, Kernel-Network, and Kernel-Audit-API-Calls providers work in an ordinary real-time `UserTrace` session (as above). The legacy "classic" kernel events (`EVENT_TRACE_FLAG_*`) need a `KernelTrace`, which is useful for the image-load rundown that populates the driver table. Both require administrator privileges.
 
-If using `ferrisetw`, use `KernelTrace` for kernel providers:
 ```rust
-use ferrisetw::trace::KernelTrace;
-use ferrisetw::native::etw_types::*;
+// Type-checked against ferrisetw 1.2.0 for x86_64-pc-windows-msvc.
+use ferrisetw::provider::{kernel_providers, Provider};
+use ferrisetw::trace::{KernelTrace, TraceError};
 
-let trace = KernelTrace::new()
-    .named("SentinelKernelTrace")
-    .enable(EVENT_TRACE_FLAG_PROCESS)      // Process events
-    .enable(EVENT_TRACE_FLAG_IMAGE_LOAD)   // Driver/DLL loads
-    .enable(EVENT_TRACE_FLAG_DISK_FILE_IO) // File I/O
-    .enable(EVENT_TRACE_FLAG_REGISTRY)     // Registry
-    .enable(EVENT_TRACE_FLAG_NETWORK_TCPIP)// Network
-    .start()?;
+fn start_kernel() -> Result<(), TraceError> {
+    let image_load = Provider::kernel(&kernel_providers::IMAGE_LOAD_PROVIDER)
+        .add_callback(|record, locator| {
+            // Image loads with ProcessId 0/4 are kernel drivers: record name, base, size.
+        })
+        .build();
+
+    let (trace, _handle) = KernelTrace::new()
+        .named("SentinelKernelTrace".to_string())
+        .enable(image_load)
+        .start()?;
+    // ...
+    trace.stop()
+}
 ```
 
 #### Enrichment Layer
@@ -1108,14 +1213,20 @@ impl Enricher {
 ```
 
 **Driver attribution:**
-ETW file/registry events report the source PID, not the source driver. For kernel-mode operations, the PID is typically 4 (System process). To attribute operations to specific drivers:
+ETW file/registry events report the PID of the thread that issued the operation, not the driver. Kernel code running on a system worker thread shows up as PID 4 (System); kernel code running in another thread's context (e.g., inside a callback) shows up as *that* process's PID. To attribute operations to specific drivers:
 
-1. Track `ImageLoad` events for kernel images (image loaded into PID 4 = kernel driver)
-2. Maintain a map of driver load addresses to driver names
-3. For file/registry events from PID 4, use the call stack (if available via ETW stack walking) to identify which driver initiated the operation
-4. If stack attribution isn't available, use heuristics: correlate timing with driver load/unload events and known driver behavior patterns
+1. Build a kernel module table (name, base, size) from kernel `ImageLoad` events plus a startup rundown (`EnumDeviceDrivers` / `NtQuerySystemInformation(SystemModuleInformation)`; both return real addresses only to elevated callers).
+2. Enable stack traces on the file and registry providers (`ProviderConfig::stack_trace`). Each event then carries a `StackTrace64` extended item.
+3. Walk the stack from the top. The first frame inside a module that isn't `ntoskrnl.exe`, `fltmgr.sys`, a file system, or another known I/O-stack driver identifies the originating driver.
+4. If no frame resolves to a third-party module, store the event with `driver: None`. Do **not** guess from timing: a report that attributes events by correlation will be wrong, and wrong in a way readers will treat as evidence.
 
-The minifilter driver (Phase 6) provides definitive attribution by intercepting at the filter manager level.
+Limits that reports must state:
+
+- **Memory reads are not observable.** A driver reading another process's memory (`MmCopyVirtualMemory`, `KeStackAttachProcess`, physical-memory mapping) emits no ETW event that a non-PPL consumer can receive. The minifilter cannot see it either.
+- **Code outside a loaded image is unattributable.** Obfuscated drivers may run code from allocated pool memory; those frames resolve to no module.
+- **Stack walking has a cost.** Budget for it against the <2% CPU target. Capture stacks only on the event IDs you attribute, and set `DisablePagingExecutive=1` so x64 kernel stacks walk reliably.
+
+The minifilter driver (Phase 6) adds attribution for file I/O that ETW misses, using the same stack-walk technique. It is not definitive either, and it does not cover memory reads.
 
 #### Session Build Plan
 
@@ -1150,18 +1261,33 @@ The minifilter driver (Phase 6) provides definitive attribution by intercepting 
 The Windows service wrapper around the pipeline.
 
 ```rust
-/// Service configuration loaded from %APPDATA%\Sentinel\config.toml
-#[derive(Debug, Serialize, Deserialize)]
+/// Service configuration loaded from %ProgramData%\Sentinel\config.toml.
+/// (Not %APPDATA%: the service runs as SYSTEM, whose %APPDATA% is under
+/// C:\Windows\System32\config\systemprofile and invisible to the user.)
+/// Every section and field is optional; missing ones take the defaults below.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServiceConfig {
+    pub service: ServiceSection,
     pub etw: EtwConfig,
     pub storage: StorageConfig,
+    pub pipeline: PipelineConfig,
     pub alerts: AlertConfig,
     pub ipc: IpcConfig,
+    pub profiles: ProfilesConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServiceSection {
+    /// trace | debug | info | warn | error
+    pub log_level: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StorageConfig {
-    /// Path to database. Default: %APPDATA%\Sentinel\data\sentinel.db
+    /// Path to database. Default: %ProgramData%\Sentinel\data\sentinel.db
     pub db_path: Option<String>,
     /// Days to retain events before rotation.
     pub retention_days: u32,
@@ -1172,36 +1298,64 @@ pub struct StorageConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PipelineConfig {
+    /// Events per database write.
+    pub batch_size: usize,
+    /// Max time before flushing an incomplete batch.
+    pub batch_timeout_ms: u64,
+    pub process_cache_refresh_seconds: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AlertConfig {
     pub enabled: bool,
     pub rules_from_db: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct IpcConfig {
     /// Named pipe name for CLI/dashboard communication.
     pub pipe_name: String,
 }
 
-impl Default for ServiceConfig {
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfilesConfig {
+    /// Directory containing .toml driver profiles.
+    pub directory: String,
+    /// Auto-download community profiles from GitHub (future).
+    pub auto_update: bool,
+}
+
+impl Default for ServiceSection {
+    fn default() -> Self { Self { log_level: "info".to_string() } }
+}
+
+impl Default for StorageConfig {
     fn default() -> Self {
-        Self {
-            etw: EtwConfig::default(),
-            storage: StorageConfig {
-                db_path: None,
-                retention_days: 30,
-                rotation_hour: 3,
-                max_db_size_mb: 0,
-            },
-            alerts: AlertConfig {
-                enabled: true,
-                rules_from_db: true,
-            },
-            ipc: IpcConfig {
-                pipe_name: r"\\.\pipe\sentinel-service".to_string(),
-            },
-        }
+        Self { db_path: None, retention_days: 30, rotation_hour: 3, max_db_size_mb: 0 }
     }
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self { batch_size: 200, batch_timeout_ms: 1000, process_cache_refresh_seconds: 5 }
+    }
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self { Self { enabled: true, rules_from_db: true } }
+}
+
+impl Default for IpcConfig {
+    fn default() -> Self { Self { pipe_name: r"\\.\pipe\sentinel-service".to_string() } }
+}
+
+impl Default for ProfilesConfig {
+    fn default() -> Self { Self { directory: "profiles".to_string(), auto_update: false } }
 }
 ```
 
@@ -1365,6 +1519,8 @@ sentinel
 
 #### Terminal Output Formatting
 
+Sample output is illustrative. Names and values are invented to show formatting, not observations of any product.
+
 ```
 $ sentinel status
 
@@ -1382,12 +1538,12 @@ $ sentinel status
   │ nvlddmkm.sys         │ NVIDIA         │ —         │ 89       │
   └──────────────────────┴────────────────┴───────────┴──────────┘
 
-$ sentinel watch --driver vgk.sys --events process,network
+$ sentinel watch --process vgc.exe --events process,network
 
-  14:22:01.334  PROCESS_ACCESS  vgk.sys → chrome.exe (PID 4521)  READ_MEMORY
-  14:22:01.412  PROCESS_ACCESS  vgk.sys → discord.exe (PID 8832) READ_MEMORY
-  14:22:02.001  NETWORK_SEND    vgk.sys → 104.18.23.2:443        1.2 KB
-  14:22:03.118  PROCESS_ACCESS  vgk.sys → explorer.exe (PID 2104) QUERY_INFO
+  14:22:01.334  PROCESS_ACCESS  vgc.exe → chrome.exe (PID 4521)  OPEN VM_READ|QUERY_INFO
+  14:22:01.412  PROCESS_ACCESS  vgc.exe → discord.exe (PID 8832) OPEN VM_READ|QUERY_INFO
+  14:22:02.001  NETWORK_SEND    vgc.exe → 104.18.23.2:443        1.2 KB
+  14:22:03.118  PROCESS_ACCESS  vgc.exe → explorer.exe (PID 2104) OPEN QUERY_LIMITED_INFO
   ^C (Ctrl+C to stop)
 
 $ sentinel query files --driver vgk.sys --exclude "C:\Riot Games\*" --today
@@ -1536,6 +1692,8 @@ pub fn dispatch(alert: &TriggeredAlert, action: &AlertAction) {
 
 ### Dashboard Layout
 
+Mockup data is illustrative, not observations of any product.
+
 ```
 ┌─[Sentinel — Kernel Activity Monitor]──────────────────────────────────┐
 │                                                                        │
@@ -1562,8 +1720,8 @@ pub fn dispatch(alert: &TriggeredAlert, action: &AlertAction) {
 │  ┌─[Tab: Live Stream]───────────────────────────────────────────────┐  │
 │  │ Filter: [driver ▾] [event type ▾] [target pattern        ] [Go]  │  │
 │  │                                                                    │ │
-│  │ 14:22:01.334  PROC_ACCESS  vgk.sys → chrome.exe      READ_MEM   │ │
-│  │ 14:22:01.412  PROC_ACCESS  vgk.sys → discord.exe     READ_MEM   │ │
+│  │ 14:22:01.334  PROC_ACCESS  vgc.exe → chrome.exe      VM_READ    │ │
+│  │ 14:22:01.412  PROC_ACCESS  vgc.exe → discord.exe     VM_READ    │ │
 │  │ 14:22:02.001  NET_SEND     vgk.sys → 104.18.23.2     1.2 KB     │ │
 │  │ 14:22:03.118  FILE_READ    vgk.sys → Discord\*.log   OUTSIDE    │ │
 │  │ ...                                                               │ │
@@ -1658,14 +1816,28 @@ async fn set_alert_rules(rules: Vec<AlertRule>) -> Result<(), String>;
 ## Phase 6 — Minifilter Driver (Optional)
 
 **Sessions:** 3–5 (requires Windows Driver Kit)  
-**Goal:** Kernel-mode filter driver for definitive driver attribution.
+**Goal:** Kernel-mode filter driver that attributes file I/O to the originating driver, including I/O that ETW stack traces miss.
+
+### Scope
+
+A minifilter (Filter Manager) only sees **file system** I/O. The other callbacks this driver could add are separate kernel mechanisms, each with its own registration:
+
+| What | Mechanism | Sees |
+|------|-----------|------|
+| File I/O | Minifilter (`FltRegisterFilter`) | All file system operations, including kernel-mode ones |
+| Registry | `CmRegisterCallbackEx` | All registry operations, including kernel-mode ones |
+| Process/thread handles | `ObRegisterCallbacks` | Handle opens/duplicates. Drivers that reference processes by pointer (`PsLookupProcessByProcessId`) create no handle and never appear |
+| Process memory reads | — | **Nothing.** No supported callback exists for `MmCopyVirtualMemory` / `KeStackAttachProcess` |
+
+Attribution works the same way in all of them: walk the stack in the **originating thread's context** and find the first frame in a third-party module.
 
 ### Prerequisites
 
 - Windows Driver Kit (WDK) installed
 - Visual Studio with WDK integration
-- Test signing enabled for development (`bcdedit /set testsigning on`)
-- EV certificate for production signing (Phase 7)
+- A minifilter altitude assigned by Microsoft (allocated on request; see "Load order groups and altitudes for minifilter drivers" in the WDK docs). Use a test altitude only in development
+- Test signing enabled for development (`bcdedit /set testsigning on`). **Riot Vanguard refuses to run with test signing on (VAN 128)**, and EasyAntiCheat and BattlEye reportedly do too. A test-signed build can be developed against ordinary drivers, but observing an anti-cheat requires the production (attestation-signed) build.
+- EV certificate for production signing (see Driver Signing below)
 
 ### Driver Architecture
 
@@ -1675,9 +1847,21 @@ async fn set_alert_rules(rules: Vec<AlertRule>) -> Result<(), String>;
 #include <fltKernel.h>
 #include <ntddk.h>
 
+PFLT_FILTER g_Filter = NULL;
+
 // Communication port for user-mode service
 PFLT_PORT g_ServerPort = NULL;
 PFLT_PORT g_ClientPort = NULL;
+
+// Operation callbacks — observe only, never modify.
+// Defined before FilterRegistration, which references it.
+const FLT_OPERATION_REGISTRATION Callbacks[] = {
+    { IRP_MJ_CREATE,  0, PreCreateCallback,  PostCreateCallback },
+    { IRP_MJ_READ,    0, PreReadCallback,    NULL },
+    { IRP_MJ_WRITE,   0, PreWriteCallback,   NULL },
+    { IRP_MJ_SET_INFORMATION, 0, PreSetInfoCallback, NULL },
+    { IRP_MJ_OPERATION_END }
+};
 
 // Minifilter registration structure
 const FLT_REGISTRATION FilterRegistration = {
@@ -1693,18 +1877,13 @@ const FLT_REGISTRATION FilterRegistration = {
     NULL,                       // Instance teardown complete
     NULL, NULL, NULL            // Unused
 };
-
-// Operation callbacks — observe only, never modify
-const FLT_OPERATION_REGISTRATION Callbacks[] = {
-    { IRP_MJ_CREATE,  0, PreCreateCallback,  PostCreateCallback },
-    { IRP_MJ_READ,    0, NULL,               PostReadCallback },
-    { IRP_MJ_WRITE,   0, NULL,               PostWriteCallback },
-    { IRP_MJ_SET_INFORMATION, 0, NULL,        PostSetInfoCallback },
-    { IRP_MJ_OPERATION_END }
-};
 ```
 
-**Critical design constraint:** Every callback returns `FLT_PREOP_SUCCESS_NO_CALLBACK` or `FLT_POSTOP_FINISHED_PROCESSING`. Never `FLT_PREOP_COMPLETE` (which would block the operation). The driver is an observer — it must never interfere with I/O.
+**Critical design constraint:** The driver is an observer. It must never interfere with I/O.
+
+- Pre-operation callbacks return `FLT_PREOP_SUCCESS_WITH_CALLBACK` only where a post-op result is needed (create: did the open succeed?), otherwise `FLT_PREOP_SUCCESS_NO_CALLBACK`. Never `FLT_PREOP_COMPLETE` or `FLT_PREOP_PENDING`, never modify parameters or buffers.
+- Post-operation callbacks return `FLT_POSTOP_FINISHED_PROCESSING`.
+- **Capture attribution in the pre-op callback.** Pre-op runs in the issuing thread for synchronous I/O. Post-op runs in an arbitrary completion context whose stack says nothing about the originator.
 
 ### Driver ↔ Service Communication
 
@@ -1715,27 +1894,24 @@ typedef struct _SENTINEL_MESSAGE {
     LARGE_INTEGER Timestamp;
     ULONG SourcePid;
     ULONG SourceTid;
-    ULONG_PTR DriverAddress;   // Return address on the call stack (identifies driver)
+    ULONG StackDepth;
+    ULONG_PTR Stack[16];       // RtlWalkFrameChain/RtlCaptureStackBackTrace in pre-op.
+                               // The top frames are fltmgr/ntoskrnl; user mode resolves
+                               // the first third-party frame against the module table.
     WCHAR Target[512];         // File path, registry key, etc.
     ULONG DataSize;            // Bytes for read/write operations
 } SENTINEL_MESSAGE, *PSENTINEL_MESSAGE;
 
-// Send message to user-mode service (non-blocking)
-NTSTATUS SendEvent(PSENTINEL_MESSAGE message) {
-    if (g_ClientPort == NULL) return STATUS_PORT_DISCONNECTED;
+// Callbacks must NOT call FltSendMessage:
+//  - post-op callbacks can run at DISPATCH_LEVEL; FltSendMessage requires
+//    IRQL <= APC_LEVEL, so calling it there can bugcheck the machine;
+//  - even a 1 ms timeout adds up to 1 ms to every file operation system-wide.
+// Instead, callbacks copy the event into a fixed-size ring buffer in nonpaged pool
+// (drop and count on overflow; never wait), and a dedicated PASSIVE_LEVEL system
+// thread drains it to the client port with FltSendMessage.
 
-    LARGE_INTEGER timeout;
-    timeout.QuadPart = -10000; // 1ms timeout — drop events rather than block I/O
-
-    return FltSendMessage(
-        g_Filter,
-        &g_ClientPort,
-        message,
-        sizeof(SENTINEL_MESSAGE),
-        NULL, NULL,
-        &timeout
-    );
-}
+VOID QueueEvent(PSENTINEL_MESSAGE message);   // IRQL <= DISPATCH_LEVEL; never blocks
+VOID DrainThread(PVOID context);              // PASSIVE_LEVEL; sends batches to g_ClientPort
 ```
 
 ### Driver Signing
@@ -1743,15 +1919,18 @@ NTSTATUS SendEvent(PSENTINEL_MESSAGE message) {
 ```
 Development:
   1. Enable test signing: bcdedit /set testsigning on
-  2. Create self-signed cert: makecert -r -pe -n "CN=Sentinel Dev" -ss PrivateCertStore sentinel-dev.cer
-  3. Sign driver: signtool sign /s PrivateCertStore /n "Sentinel Dev" sentinel-filter.sys
+     (anti-cheat software will refuse to run while this is on — see Prerequisites)
+  2. Create self-signed cert (makecert is deprecated):
+     New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=Sentinel Dev" -CertStoreLocation Cert:\CurrentUser\My
+  3. Sign driver: signtool sign /fd sha256 /n "Sentinel Dev" sentinel-filter.sys
 
 Production:
-  1. Purchase EV code signing certificate (~$300/yr)
-  2. Sign driver with EV cert
-  3. Submit to Microsoft Hardware Developer Center for attestation signing
-  4. Microsoft counter-signs the driver
-  5. Driver loads on any Windows machine without test signing
+  1. Request a minifilter altitude from Microsoft
+  2. Purchase an EV code signing certificate (keys are issued on a hardware token/HSM)
+  3. Register with the Microsoft Partner Center hardware program using the EV cert
+  4. Submit the driver package for attestation signing
+  5. Microsoft signs the driver; it loads on Windows 10/11 client without test signing
+     (Windows Server requires full WHQL certification instead)
 ```
 
 ---
@@ -1787,8 +1966,12 @@ network_destinations = [
     "*.pvp.net"
 ]
 
-# What Vanguard is known to scan (from community research)
+# Community-reported behavior. Sentinel cannot verify most of this itself
+# (memory reads are not observable), so every claim needs a citation in
+# `sources`. Profiles with unsourced claims should not be merged: they are
+# statements about a real vendor's product.
 [known_activity]
+sources = []  # e.g. "https://arxiv.org/abs/2408.00500"
 scans_all_processes = true
 scans_at_boot = true
 persists_after_game_exit = true
@@ -1808,7 +1991,7 @@ installed software via the Uninstall registry key.
 
 ## Configuration File
 
-Default location: `%APPDATA%\Sentinel\config.toml`
+Default location: `%ProgramData%\Sentinel\config.toml` (all sections optional; see `ServiceConfig`)
 
 ```toml
 [service]

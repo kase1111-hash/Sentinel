@@ -20,7 +20,7 @@ There is currently no tool that lets an ordinary user answer basic questions lik
 - Is the anti-cheat still running after I closed the game?
 - What registry keys did it read or modify?
 
-Sentinel answers these questions.
+Sentinel answers these questions as far as Windows makes them observable. See [What Sentinel Can't See](#what-sentinel-cant-see).
 
 ---
 
@@ -32,18 +32,18 @@ Sentinel is a **passive observer**. It does not block, modify, bypass, or interf
 
 Sentinel uses Event Tracing for Windows (ETW) and, where deeper visibility is needed, a minimal signed filter driver to capture:
 
-- **Process inspection events** — which processes a kernel driver reads memory from, and when
+- **Process inspection events** — which processes an anti-cheat opens handles to, with what access rights (e.g., memory read), and when
 - **File access events** — what files a driver opens, reads, or writes outside its own directory
 - **Registry access events** — what registry keys a driver queries or modifies
 - **Network activity** — outbound connections, destination IPs, data volume, timing
 - **Driver lifecycle** — when a kernel driver loads, runs, and unloads
 - **Persistence behavior** — whether a driver remains active after its associated application closes
 
-All events are timestamped and attributed to the specific driver that generated them.
+All events are timestamped and attributed to the driver or anti-cheat component that generated them, where attribution is possible.
 
 ### Audit Reports
 
-Raw logs are structured and queryable. Sentinel generates human-readable audit reports per driver:
+Raw logs are structured and queryable. Sentinel generates human-readable audit reports per driver (illustrative output; the values are invented to show the format):
 
 ```
 ── Vanguard (vgk.sys) ── Session: 2026-03-16 14:22:00 → 18:47:33 ──
@@ -51,9 +51,10 @@ Raw logs are structured and queryable. Sentinel generates human-readable audit r
   Loaded at:        14:22:00 (system boot — runs before desktop)
   Unloaded at:      STILL RUNNING (game closed at 18:47:33)
 
-  Processes scanned: 847
+  Process handles:   847 opened by vgc.exe (user-mode service)
     Top targets:     chrome.exe (312), discord.exe (198), explorer.exe (94)
     Game process:    VALORANT.exe (41)
+    Memory reads by vgk.sys: not observable (see METHODOLOGY.md)
 
   Files accessed:    23 outside game directory
     Notable:         %APPDATA%\Discord\Local Storage (read)
@@ -93,6 +94,18 @@ Sentinel is a system transparency tool. It treats anti-cheat drivers the same wa
 
 ---
 
+## What Sentinel Can't See
+
+Windows does not expose everything a kernel driver does, and Sentinel only reports what it can actually observe:
+
+- **Kernel memory reads.** When a kernel driver reads another process's memory directly (`MmCopyVirtualMemory`, attaching to the process, mapping physical memory), Windows emits no event that third-party software can receive. Neither ETW nor the optional minifilter can see it. Sentinel *can* see handle opens that request memory-read access. User-mode code, including anti-cheat services like `vgc.exe`, has to open a handle to read another process's memory.
+- **What was sent.** Network traffic is encrypted. Sentinel reports destinations, timing, and volume, not content.
+- **Perfect attribution.** File and registry events are attributed to a driver by walking the call stack. Code that runs outside a loaded driver image (common in obfuscated software) can't be attributed. Those events are reported as unattributed, never guessed.
+
+Absence of an event in a Sentinel report means "not observed," not "didn't happen." Reports say so.
+
+---
+
 ## Architecture
 
 ```
@@ -119,7 +132,8 @@ sentinel/
 │   ├── METHODOLOGY.md      # How Sentinel captures events, what it can and cannot see
 │   ├── ANTI-CHEAT-MAP.md   # Known anti-cheat drivers, behaviors, and load patterns
 │   ├── LEGAL.md            # User rights, CFAA considerations, ToS analysis
-│   └── DRIVER-SIGNING.md   # How to get the filter driver signed
+│   ├── DRIVER-SIGNING.md   # How to get the filter driver signed
+│   └── FEASIBILITY.md      # Design review: what works, what can't be observed
 └── README.md
 ```
 
@@ -145,15 +159,15 @@ The primary collection mechanism. ETW is Microsoft's built-in kernel instrumenta
 - `Microsoft-Windows-Kernel-File` — file create, read, write, delete
 - `Microsoft-Windows-Kernel-Registry` — registry open, query, set, delete
 - `Microsoft-Windows-Kernel-Network` — TCP/UDP connection events
-- `Microsoft-Windows-Kernel-Audit-API-Calls` — sensitive API usage
+- `Microsoft-Windows-Kernel-Audit-API-Calls` — process and thread handle opens (with requested access rights)
 
 ### Minifilter Driver (Optional, Deeper Visibility)
 
 For events that ETW alone cannot capture at sufficient granularity (such as which specific driver initiated a read, rather than just which process), Sentinel includes an optional minifilter driver. This driver:
 
-- Registers with the Filter Manager (standard Windows mechanism)
-- Receives pre/post callbacks for file, registry, and process operations
-- Tags each event with the originating driver's identity
+- Registers with the Filter Manager (standard Windows mechanism) for file I/O
+- Registers registry (`CmRegisterCallbackEx`) and process-handle (`ObRegisterCallbacks`) callbacks
+- Tags each event with the originating driver's identity, found by walking the call stack
 - Forwards events to the user-mode service via a communication port
 - **Never blocks, modifies, or delays any operation**
 
@@ -166,6 +180,8 @@ Windows requires kernel drivers to be signed. For development, test signing mode
 1. An EV (Extended Validation) code signing certificate
 2. Submission to Microsoft's Hardware Developer Center for attestation signing
 3. WHQL testing (optional but recommended)
+
+Note: anti-cheat software refuses to run in test-signing mode (Riot Vanguard confirmed), so a test-signed build can be developed and tested against ordinary drivers, but observing an anti-cheat requires a production-signed build.
 
 See `docs/DRIVER-SIGNING.md` for the full process.
 
@@ -241,10 +257,10 @@ sentinel query drivers --category anticheat --status active
 | Game | Anti-Cheat | Driver | Load Behavior |
 |------|-----------|--------|---------------|
 | Valorant | Vanguard | `vgk.sys` | Boot-start — loads before desktop, persists after game closes |
-| Fortnite | EasyAntiCheat | `EasyAntiCheat.sys` | On-demand — loads with game, should unload on exit |
-| Call of Duty | Ricochet | `atvi-reven.sys` | On-demand — kernel driver loads with game |
+| Fortnite | EasyAntiCheat (EOS) | `EasyAntiCheat_EOS.sys` | On-demand — loads with game, should unload on exit |
+| Call of Duty | Ricochet | `atvi-randgrid.sys` | On-demand — kernel driver loads with game |
 | PUBG / DayZ / Ark | BattlEye | `BEDaisy.sys` | On-demand — loads with game |
-| Apex Legends | EasyAntiCheat | `EasyAntiCheat.sys` | On-demand — shared with other EAC titles |
+| Apex Legends | EasyAntiCheat | `EasyAntiCheat.sys` / `EasyAntiCheat_EOS.sys` | On-demand — shared with other EAC titles |
 | Genshin Impact | mhyprot2 | `mhyprot2.sys` | On-demand — has been exploited as an attack vector by malware |
 
 Sentinel maintains a database of known anti-cheat driver signatures and behaviors in `docs/ANTI-CHEAT-MAP.md`. Community contributions welcome.
@@ -263,7 +279,10 @@ Monitoring software running on your own hardware is legal in most jurisdictions.
 Process Monitor (ProcMon) is excellent but wasn't designed for persistent auditing. It's a real-time debugging tool — you have to be running it at the right time, it doesn't filter well by driver origin, and it doesn't generate reports or maintain history. Sentinel runs as a background service and builds a searchable audit trail over time.
 
 **Does this work without the kernel driver?**
-Yes. ETW-only mode captures the majority of useful events. The minifilter driver adds driver-level attribution (knowing *which* kernel driver initiated an operation, not just which process) and catches events in code paths that bypass ETW.
+Yes. ETW-only mode captures the majority of useful events, and attributes file and registry activity to drivers using ETW call stacks. The minifilter driver adds attribution for file I/O that ETW misses. Neither mode can see a kernel driver reading another process's memory (see [What Sentinel Can't See](#what-sentinel-cant-see)).
+
+**Why not just use Sysmon?**
+Sysmon logs much of the same raw data (driver loads, network connections, process handle opens, file and registry events) and is a good tool. It is generic: it doesn't know which events belong to an anti-cheat, whether a driver is still loaded after its game exited, or how to turn a week of logs into a readable answer. Sentinel is that layer: anti-cheat profiles, per-product attribution across the kernel driver and its user-mode service, persistence detection, and audit reports.
 
 **Can I use this to audit non-gaming software?**
 Absolutely. Sentinel monitors all kernel drivers, not just anti-cheat. DRM systems, hardware vendor drivers, security software, enterprise management tools — anything running in kernel mode is observable.
